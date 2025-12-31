@@ -1,9 +1,9 @@
 //===- tool_main.cpp - QEMU Passes Driver ---------------------------------===//
 //
 // Driver for QEMU conversion passes:
-// 1. clock-signal-detection - Detect and mark clock signals
+// 1. clock-signal-detection - Detect and mark clock signals (two-level)
 // 2. drv-classification - Classify drv operations
-// 3. clock-drv-removal - Remove clock-related and UNCHANGED drvs
+// 3. clock-drv-removal - Remove filterable clock topology
 //
 // Usage:
 //   qemu-passes input.mlir --clock-signal-detection

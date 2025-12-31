@@ -21,19 +21,34 @@
 namespace clock_analysis {
 
 //===----------------------------------------------------------------------===//
+// Base Signal 工具（统一穿透 SigExtract）
+//===----------------------------------------------------------------------===//
+
+/// 获取信号的 base signal（穿透 SigExtract）
+/// 这是统一的 base-signal 规则，Pass1/Pass3 都应使用
+inline mlir::Value getBaseSignal(mlir::Value sig) {
+  while (auto ex = sig.getDefiningOp<circt::llhd::SigExtractOp>())
+    sig = ex.getInput();
+  return sig;
+}
+
+/// 比较两个信号是否是同一个 base signal
+inline bool isSameBaseSignal(mlir::Value sig1, mlir::Value sig2) {
+  return getBaseSignal(sig1) == getBaseSignal(sig2);
+}
+
+//===----------------------------------------------------------------------===//
 // 信号名称获取
 //===----------------------------------------------------------------------===//
 
-/// 获取信号名称
+/// 获取信号名称（穿透 SigExtract）
 inline std::string getSignalName(mlir::Value signal) {
+  // 先获取 base signal
+  signal = getBaseSignal(signal);
   if (auto sigOp = signal.getDefiningOp<circt::llhd::SignalOp>()) {
     if (auto name = sigOp.getName()) {
       return name->str();
     }
-  }
-  // 处理 sig.extract
-  if (auto sigExtract = signal.getDefiningOp<circt::llhd::SigExtractOp>()) {
-    return getSignalName(sigExtract.getInput());
   }
   return "unnamed";
 }
@@ -61,12 +76,16 @@ inline int getSignalBitWidth(mlir::Value signal) {
 /// 1. 单比特 (i1)
 /// 2. 在 wait 敏感列表中
 /// 3. 无逻辑驱动（只有端口连接）
+///
+/// 使用 base-signal 比较，统一穿透 SigExtract
 inline bool isClockSignalByUsagePattern(mlir::Value signal,
                                          circt::llhd::ProcessOp processOp) {
   if (!processOp)
     return false;
 
-  auto sigOp = signal.getDefiningOp<circt::llhd::SignalOp>();
+  // 获取 base signal 进行比较
+  mlir::Value baseSignal = getBaseSignal(signal);
+  auto sigOp = baseSignal.getDefiningOp<circt::llhd::SignalOp>();
   if (!sigOp)
     return false;
 
@@ -81,12 +100,13 @@ inline bool isClockSignalByUsagePattern(mlir::Value signal,
     }
   }
 
-  // 2. 检查是否在 wait 敏感列表中
+  // 2. 检查是否在 wait 敏感列表中（使用 base-signal 比较）
   bool isInWaitSensitivity = false;
   processOp.walk([&](circt::llhd::WaitOp waitOp) {
     for (mlir::Value observed : waitOp.getObserved()) {
       if (auto prbOp = observed.getDefiningOp<circt::llhd::PrbOp>()) {
-        if (prbOp.getSignal() == signal) {
+        // 使用 base-signal 比较
+        if (isSameBaseSignal(prbOp.getSignal(), baseSignal)) {
           isInWaitSensitivity = true;
           return mlir::WalkResult::interrupt();
         }
@@ -99,10 +119,12 @@ inline bool isClockSignalByUsagePattern(mlir::Value signal,
     return false;
 
   // 3. 检查是否有逻辑驱动（非端口连接的 drv）
+  // 使用 base-signal 比较
   bool hasLogicDrv = false;
   if (auto parentOp = processOp->getParentOfType<circt::hw::HWModuleOp>()) {
     parentOp.walk([&](circt::llhd::DrvOp drvOp) {
-      if (drvOp.getSignal() == signal) {
+      // 使用 base-signal 比较
+      if (isSameBaseSignal(drvOp.getSignal(), baseSignal)) {
         mlir::Value drvValue = drvOp.getValue();
         // 如果驱动值不是 BlockArgument（输入端口），则是逻辑驱动
         if (!mlir::isa<mlir::BlockArgument>(drvValue)) {
@@ -250,14 +272,16 @@ inline void collectBranchDrvEffects(
 /// 检查 AND 操作是否是边沿检测模式
 /// 边沿检测模式：and(!old_sig, new_sig) 或 and(old_sig, !new_sig)
 /// 关键特征：同一个信号的两次 prb（旧值和新值）参与运算
+/// 使用 base-signal 比较
 inline bool isEdgeDetectionPattern(circt::comb::AndOp andOp, mlir::Value signal) {
   bool hasDirectPrb = false;   // 有直接的 prb signal
   bool hasInvertedPrb = false; // 有 xor(prb signal, true)
+  mlir::Value baseSignal = getBaseSignal(signal);
 
   for (mlir::Value operand : andOp.getOperands()) {
     // 检查直接的 prb
     if (auto prbOp = operand.getDefiningOp<circt::llhd::PrbOp>()) {
-      if (prbOp.getSignal() == signal) {
+      if (isSameBaseSignal(prbOp.getSignal(), baseSignal)) {
         hasDirectPrb = true;
       }
     }
@@ -272,7 +296,7 @@ inline bool isEdgeDetectionPattern(circt::comb::AndOp andOp, mlir::Value signal)
           }
         }
         if (auto prbOp = xorOperand.getDefiningOp<circt::llhd::PrbOp>()) {
-          if (prbOp.getSignal() == signal) {
+          if (isSameBaseSignal(prbOp.getSignal(), baseSignal)) {
             hasPrbToSignal = true;
           }
         }
@@ -315,12 +339,14 @@ inline bool isSignalInEdgeDetection(mlir::Value cond, mlir::Value signal) {
 
 /// 检查信号是否在 process 中被用作消歧检查
 /// 消歧检查：cf.cond_br (prb signal) 或 cf.cond_br (xor (prb signal), true)
+/// 使用 base-signal 比较
 inline bool isSignalUsedForDisambiguation(mlir::Value signal,
                                            circt::llhd::ProcessOp processOp) {
   bool isUsed = false;
+  mlir::Value baseSignal = getBaseSignal(signal);
   processOp.walk([&](mlir::cf::CondBranchOp condBr) {
     TracedSignal traced = traceToSignal(condBr.getCondition());
-    if (traced.isValid() && traced.signal == signal) {
+    if (traced.isValid() && isSameBaseSignal(traced.signal, baseSignal)) {
       isUsed = true;
       return mlir::WalkResult::interrupt();
     }
@@ -336,6 +362,7 @@ inline bool isSignalUsedForDisambiguation(mlir::Value signal,
 /// 2. 如果在复合边沿条件中，检查是否用于消歧：
 ///    - 不用于消歧（纯边沿触发）→ 可过滤的时钟
 ///    - 用于消歧（控制行为）→ 不可过滤
+/// 使用 base-signal 比较
 inline TriggerBranchEffect analyzeTriggerBranchEffects(
     mlir::Value signal,
     circt::llhd::ProcessOp processOp) {
@@ -343,6 +370,9 @@ inline TriggerBranchEffect analyzeTriggerBranchEffects(
   TriggerBranchEffect effect;
   if (!signal || !processOp)
     return effect;
+
+  // 获取 base signal
+  mlir::Value baseSignal = getBaseSignal(signal);
 
   // 收集 wait blocks
   llvm::SmallPtrSet<mlir::Block*, 8> waitBlocks;
@@ -359,8 +389,8 @@ inline TriggerBranchEffect analyzeTriggerBranchEffects(
     mlir::Value cond = condBr.getCondition();
     TracedSignal traced = traceToSignal(cond);
 
-    // 情况1：直接的边沿检测
-    if (traced.isValid() && traced.signal == signal) {
+    // 情况1：直接的边沿检测（使用 base-signal 比较）
+    if (traced.isValid() && isSameBaseSignal(traced.signal, baseSignal)) {
       foundDirectEdgeCheck = true;
       llvm::SmallPtrSet<mlir::Block*, 16> visitedTrue;
       llvm::SmallPtrSet<mlir::Block*, 16> visitedFalse;
@@ -370,7 +400,7 @@ inline TriggerBranchEffect analyzeTriggerBranchEffects(
     }
 
     // 情况2：检查是否在复合边沿条件中
-    if (isSignalInEdgeDetection(cond, signal)) {
+    if (isSignalInEdgeDetection(cond, baseSignal)) {
       foundInCompositeEdge = true;
     }
   });

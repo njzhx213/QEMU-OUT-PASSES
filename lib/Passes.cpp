@@ -1,9 +1,10 @@
 //===- Passes.cpp - QEMU conversion passes implementation -----------------===//
 //
 // Implementation of three passes for LLHD to QEMU conversion:
-// 1. ClockSignalDetectionPass - Detect and mark clock signals
+// 1. ClockSignalDetectionPass - Detect and mark clock signals (two-level)
 // 2. DrvClassificationPass - Classify drv operations
-// 3. ClockDrvRemovalPass - Remove clock-related and UNCHANGED drvs
+// 3. ClockDrvRemovalPass - Remove filterable clock topology
+//    (aligned with old framework SignalTracing.h)
 //
 //===----------------------------------------------------------------------===//
 
@@ -12,10 +13,12 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/LLHD/IR/LLHDOps.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/raw_ostream.h"
 
 // TableGen 生成的 Pass 声明
@@ -336,11 +339,12 @@ struct ClockDrvRemovalPass
     return result;
   }
 
-  //=== Step 4: 安全的 DCE（加入 side-effect 判定）===//
+  //=== Step 4: 安全的 DCE（使用 MLIR MemoryEffect 接口 + 显式白名单）===//
 
-  /// 检查操作是否没有内存副作用
+  /// 检查操作是否没有内存副作用（对齐旧框架边界）
+  /// 使用 MLIR 的 MemoryEffectOpInterface 优先，加上显式白名单
   static bool isOpMemoryEffectFree(Operation *op) {
-    // 显式排除有副作用的 LLHD 操作
+    // 显式排除有副作用的 LLHD 操作（不可删除）
     if (isa<llhd::DrvOp, llhd::WaitOp, llhd::SignalOp>(op))
       return false;
     // 跳过 terminator
@@ -349,18 +353,28 @@ struct ClockDrvRemovalPass
     // 跳过容器操作
     if (isa<hw::HWModuleOp, llhd::ProcessOp>(op))
       return false;
-    // 其他操作：检查是否有 side effects trait
-    // 对于 comb 操作，它们都是纯函数，无副作用
-    if (isa<comb::CombDialect>(op->getDialect()))
-      return true;
-    // 对于 hw::ConstantOp
-    if (isa<hw::ConstantOp>(op))
+
+    // 显式白名单：这些操作可以安全删除
+    // llhd.sig.extract - 信号切片，纯函数，必须支持以解除 clock sig 的引用
+    if (isa<llhd::SigExtractOp>(op))
       return true;
     // llhd.prb 是只读操作，可以安全删除
     if (isa<llhd::PrbOp>(op))
       return true;
     // llhd.constant_time 是纯常量
     if (isa<llhd::ConstantTimeOp>(op))
+      return true;
+    // hw::ConstantOp
+    if (isa<hw::ConstantOp>(op))
+      return true;
+    // comb 操作都是纯函数，无副作用
+    if (op->getDialect() &&
+        op->getDialect()->getNamespace() == "comb")
+      return true;
+
+    // 使用 MLIR MemoryEffect 接口作为兜底
+    // 注意：某些 LLHD 操作可能没有正确实现此接口，所以显式白名单优先
+    if (mlir::isMemoryEffectFree(op))
       return true;
 
     return false;
@@ -440,7 +454,8 @@ struct ClockDrvRemovalPass
       llvm::outs() << "\nModule: @" << hwMod.getName() << "\n";
 
       // 收集需要删除的 process（纯时钟触发的 process）
-      llvm::SmallVector<llhd::ProcessOp, 4> processesToRemove;
+      // 使用 SmallPtrSet 去重，避免 double erase
+      llvm::SmallPtrSet<Operation*, 8> processesToRemove;
 
       //=== 对每个 clock-triggered process 进行处理 ===//
       hwMod.walk([&](llhd::ProcessOp proc) {
@@ -556,7 +571,15 @@ struct ClockDrvRemovalPass
 
         //=== Step 2c: 从 wait observed 中移除 clock probe ===//
         if (processModified) {
-          proc.walk([&](llhd::WaitOp waitOp) {
+          // 检查是否已经被标记为要删除的 process
+          if (processesToRemove.contains(proc.getOperation()))
+            return;  // 已标记删除，跳过
+
+          proc.walk([&](llhd::WaitOp waitOp) -> WalkResult {
+            // 如果 process 已被标记删除，中断 walk
+            if (processesToRemove.contains(proc.getOperation()))
+              return WalkResult::interrupt();
+
             llvm::SmallVector<unsigned, 4> indicesToRemove;
             auto observed = waitOp.getObserved();
             unsigned nonClockCount = 0;
@@ -580,8 +603,8 @@ struct ClockDrvRemovalPass
               if (allConditionsRemoved) {
                 // 触发条件也全被移除了：可以删除整个 process
                 llvm::outs() << "    [STEP 2c] Process is pure clock-only, mark for removal\n";
-                processesToRemove.push_back(proc);
-                return;  // 不需要继续处理 wait
+                processesToRemove.insert(proc.getOperation());
+                return WalkResult::interrupt();  // 中断 walk，不继续处理此 process
               } else {
                 // 保留至少一个 clock observed（不产生空 wait）
                 llvm::outs() << "    [STEP 2c] Keep one clock observed to avoid empty wait\n";
@@ -600,14 +623,15 @@ struct ClockDrvRemovalPass
               mutableObserved.erase(*it);
               removedFromWait++;
             }
+            return WalkResult::advance();
           });
         }
       });
 
-      // 删除纯时钟触发的 process
-      for (llhd::ProcessOp proc : processesToRemove) {
+      // 删除纯时钟触发的 process（使用 SmallPtrSet 已去重）
+      for (Operation *op : processesToRemove) {
         llvm::outs() << "  [REMOVE PROCESS] Pure clock-only process\n";
-        proc.erase();
+        op->erase();
         removedProcesses++;
       }
 

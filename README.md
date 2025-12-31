@@ -7,14 +7,21 @@ MLIR passes for converting LLHD IR to QEMU device code.
 1. **ClockSignalDetection** - Detect and mark clock signals
    - Level 1: Structural check (1-bit, in sensitivity list, no logic drv)
    - Level 2: Trigger effect check (edge detection pattern, not used for disambiguation)
+   - Marks: `qemu.is_clock` on signals, `qemu.clock_triggered` on processes
 
 2. **DrvClassification** - Classify drv operations
    - UNCHANGED: Hold pattern or overwrite
    - ACCUMULATE: Counter increment/decrement
    - LOOP_ITER: Loop iterator
    - COMPLEX: Other patterns
+   - Marks: `qemu.drv_class` attribute
 
-3. **ClockDrvRemoval** - Remove clock signals and their connections
+3. **ClockDrvRemoval** - Remove filterable clock topology (aligned with SignalTracing.h)
+   - Remove clock edge terms from trigger OR conditions (minimal rewrite)
+   - Remove clock probes from wait observed lists (prevents empty wait)
+   - Run safe DCE with MLIR MemoryEffect interface
+   - Remove clock port connection drvs (only BlockArgument values)
+   - Remove dead clock signal definitions
 
 ## Build
 
