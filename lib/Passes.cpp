@@ -221,116 +221,170 @@ struct DrvClassificationPass
 
 //===----------------------------------------------------------------------===//
 // Pass 3: ClockDrvRemovalPass
-// 完整删除时钟信号相关的 LLHD 拓扑链：
+// 完整删除时钟信号相关的 LLHD 拓扑链（对齐旧框架 SignalTracing.h）：
 // 1. 收集时钟信号（qemu.is_clock 属性）
-// 2. 从 wait observed 列表中移除时钟
-// 3. 重写 CFG：将时钟边沿检测的 cond_br 改为无条件 br
-// 4. DCE：删除死代码（prb、组合逻辑）
-// 5. 删除时钟的端口连接 drv
-// 6. 删除时钟的 sig 定义
+// 2. 对每个 clock-triggered process：
+//    a. 收集 waitBlocks（旧框架同款）
+//    b. 从 trigger OR 中剔除 clock edge term（最小改写，不误伤 enable guard）
+//    c. 从 wait observed 中移除 clock probe（防止空 wait）
+// 3. DCE：删除死代码（需要 isMemoryEffectFree）
+// 4. 删除时钟的端口连接 drv（仅 BlockArgument 驱动值）
+// 5. 删除时钟的 sig 定义
 //===----------------------------------------------------------------------===//
 
 struct ClockDrvRemovalPass
     : public ::impl::ClockDrvRemovalBase<ClockDrvRemovalPass> {
 
-  // 检查操作是否只被时钟相关操作使用
-  bool isOnlyUsedByClockOps(Operation *op,
-                            llvm::DenseSet<Operation*> &opsToRemove) {
-    for (Value result : op->getResults()) {
-      for (Operation *user : result.getUsers()) {
-        if (opsToRemove.count(user) == 0) {
-          return false;
-        }
-      }
-    }
-    return true;
+  //=== Step 0: 统一的 base signal 工具（对齐 ClockAnalysis.h 的 unwrap 思路）===//
+
+  /// 获取信号的 base signal（穿透 SigExtract）
+  static Value getBaseSignal(Value sig) {
+    while (auto ex = sig.getDefiningOp<llhd::SigExtractOp>())
+      sig = ex.getInput();
+    return sig;
   }
 
-  // 检查条件是否涉及时钟信号的边沿检测
-  bool isClockEdgeCondition(Value cond, llvm::DenseSet<Value> &clockSignals) {
-    Operation *defOp = cond.getDefiningOp();
-    if (!defOp)
-      return false;
+  /// 检查信号是否是时钟信号（使用 base signal 比较）
+  static bool isClockBaseSignal(Value sigOrExtract,
+                                const llvm::DenseSet<Value> &clockSignals) {
+    return clockSignals.count(getBaseSignal(sigOrExtract));
+  }
 
-    // 检查 AND 操作（边沿检测）
-    if (auto andOp = dyn_cast<comb::AndOp>(defOp)) {
-      for (Value operand : andOp.getOperands()) {
-        // 直接 prb
-        if (auto prbOp = operand.getDefiningOp<llhd::PrbOp>()) {
-          if (clockSignals.count(prbOp.getSignal())) {
-            return true;
-          }
-        }
-        // 取反的 prb (xor prb, true)
-        if (auto xorOp = operand.getDefiningOp<comb::XorOp>()) {
-          for (Value xorOperand : xorOp.getOperands()) {
-            if (auto prbOp = xorOperand.getDefiningOp<llhd::PrbOp>()) {
-              if (clockSignals.count(prbOp.getSignal())) {
-                return true;
-              }
+  //=== Step 3.1: 拍平 OR 操作 ===//
+
+  /// 将 OR 操作递归拍平为 terms 列表
+  static void flattenOr(Value v, llvm::SmallVectorImpl<Value> &terms) {
+    if (auto orOp = v.getDefiningOp<comb::OrOp>()) {
+      for (auto opnd : orOp.getOperands())
+        flattenOr(opnd, terms);
+      return;
+    }
+    terms.push_back(v);
+  }
+
+  //=== Step 3.2: 严格的边沿检测 term 识别 ===//
+
+  /// 边沿检测 term 结构：包含 base signal 信息
+  struct EdgeTermInfo {
+    bool isEdgeTerm = false;
+    Value baseSignal;  // 边沿检测的信号
+  };
+
+  /// 检查一个 term 是否是边沿检测模式，返回其 base signal
+  /// 边沿检测模式：comb.and(prb(sig), xor(prb(sig), true))
+  /// 必须同时有 direct prb 和 inverted prb，且指向同一 base signal
+  EdgeTermInfo analyzeEdgeTerm(Value term) {
+    EdgeTermInfo info;
+
+    auto andOp = term.getDefiningOp<comb::AndOp>();
+    if (!andOp)
+      return info;
+
+    Value directPrbSignal;
+    Value invertedPrbSignal;
+
+    for (Value operand : andOp.getOperands()) {
+      // 检查直接的 prb
+      if (auto prbOp = operand.getDefiningOp<llhd::PrbOp>()) {
+        directPrbSignal = getBaseSignal(prbOp.getSignal());
+      }
+      // 检查 xor(prb signal, true) - 取反
+      if (auto xorOp = operand.getDefiningOp<comb::XorOp>()) {
+        bool hasConstTrue = false;
+        Value prbSig;
+        for (Value xorOperand : xorOp.getOperands()) {
+          if (auto constOp = xorOperand.getDefiningOp<hw::ConstantOp>()) {
+            if (constOp.getValue().isAllOnes()) {
+              hasConstTrue = true;
             }
           }
+          if (auto prbOp = xorOperand.getDefiningOp<llhd::PrbOp>()) {
+            prbSig = getBaseSignal(prbOp.getSignal());
+          }
+        }
+        if (hasConstTrue && prbSig) {
+          invertedPrbSignal = prbSig;
         }
       }
     }
 
-    // 检查 OR 操作（复合边沿条件）
-    if (auto orOp = dyn_cast<comb::OrOp>(defOp)) {
-      for (Value operand : orOp.getOperands()) {
-        if (isClockEdgeCondition(operand, clockSignals)) {
-          return true;
-        }
-      }
+    // 边沿检测必须同时有直接 prb 和取反 prb，且指向同一 base signal
+    if (directPrbSignal && invertedPrbSignal &&
+        directPrbSignal == invertedPrbSignal) {
+      info.isEdgeTerm = true;
+      info.baseSignal = directPrbSignal;
     }
+
+    return info;
+  }
+
+  //=== Step 3.3: 从 trigger 中剔除 clock edge terms 并重建条件 ===//
+
+  /// 重建 OR 操作（从 terms 列表）
+  Value rebuildOrChain(OpBuilder &builder, Location loc,
+                       ArrayRef<Value> terms) {
+    if (terms.empty())
+      return nullptr;
+    if (terms.size() == 1)
+      return terms[0];
+
+    // 递归构建二叉 OR 树
+    Value result = terms[0];
+    for (size_t i = 1; i < terms.size(); ++i) {
+      result = builder.create<comb::OrOp>(loc, result, terms[i]);
+    }
+    return result;
+  }
+
+  //=== Step 4: 安全的 DCE（加入 side-effect 判定）===//
+
+  /// 检查操作是否没有内存副作用
+  static bool isOpMemoryEffectFree(Operation *op) {
+    // 显式排除有副作用的 LLHD 操作
+    if (isa<llhd::DrvOp, llhd::WaitOp, llhd::SignalOp>(op))
+      return false;
+    // 跳过 terminator
+    if (op->hasTrait<OpTrait::IsTerminator>())
+      return false;
+    // 跳过容器操作
+    if (isa<hw::HWModuleOp, llhd::ProcessOp>(op))
+      return false;
+    // 其他操作：检查是否有 side effects trait
+    // 对于 comb 操作，它们都是纯函数，无副作用
+    if (isa<comb::CombDialect>(op->getDialect()))
+      return true;
+    // 对于 hw::ConstantOp
+    if (isa<hw::ConstantOp>(op))
+      return true;
+    // llhd.prb 是只读操作，可以安全删除
+    if (isa<llhd::PrbOp>(op))
+      return true;
+    // llhd.constant_time 是纯常量
+    if (isa<llhd::ConstantTimeOp>(op))
+      return true;
 
     return false;
   }
 
-  // 收集条件表达式中涉及的所有操作
-  void collectConditionOps(Value cond, llvm::DenseSet<Operation*> &ops) {
-    Operation *defOp = cond.getDefiningOp();
-    if (!defOp || ops.count(defOp))
-      return;
-
-    ops.insert(defOp);
-
-    for (Value operand : defOp->getOperands()) {
-      collectConditionOps(operand, ops);
-    }
-  }
-
-  // 运行 DCE：删除时钟相关的死代码
-  // 策略：迭代删除没有使用者的操作
-  void runLocalDCE(hw::HWModuleOp hwMod, llvm::DenseSet<Value> &clockSignals,
-                   int &removedOps) {
-    // 多轮迭代删除死代码
+  /// 运行安全的 DCE：只删除无副作用且无使用者的操作
+  void runSafeDCE(hw::HWModuleOp hwMod, int &removedOps) {
     bool changed = true;
     int iterations = 0;
-    const int maxIterations = 20;  // 防止无限循环
+    const int maxIterations = 20;
 
     while (changed && iterations < maxIterations) {
       changed = false;
       iterations++;
 
-      // 先收集所有操作到一个列表中（使用 post-order 确保先访问子操作）
+      // 使用 post-order 收集所有操作
       llvm::SmallVector<Operation*, 64> allOps;
       hwMod.walk<WalkOrder::PostOrder>([&](Operation *op) {
         allOps.push_back(op);
       });
 
-      // 检查并删除死代码
       for (Operation *op : allOps) {
-        // 跳过有副作用的操作
-        if (isa<llhd::DrvOp, llhd::WaitOp, llhd::SignalOp>(op))
-          continue;
-        // 跳过 terminator
-        if (op->hasTrait<OpTrait::IsTerminator>())
-          continue;
-        // 跳过 hw.module 自身
-        if (isa<hw::HWModuleOp>(op))
-          continue;
-        // 跳过 llhd.process
-        if (isa<llhd::ProcessOp>(op))
+        // 跳过不能删除的操作
+        if (!isOpMemoryEffectFree(op))
           continue;
 
         // 检查结果是否都没有使用者
@@ -353,19 +407,21 @@ struct ClockDrvRemovalPass
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
-    MLIRContext *ctx = mod.getContext();
 
     llvm::outs() << "========================================\n";
-    llvm::outs() << "Pass 3: Clock Signal Removal (Complete)\n";
+    llvm::outs() << "Pass 3: Clock Signal Removal (Fixed)\n";
+    llvm::outs() << "(Aligned with old framework SignalTracing.h)\n";
     llvm::outs() << "========================================\n\n";
 
     int removedFromWait = 0;
     int rewrittenBranches = 0;
+    int removedClockTerms = 0;
     int removedDCE = 0;
     int removedDrvs = 0;
     int removedSignals = 0;
+    int removedProcesses = 0;
 
-    //=== Step 1: 收集所有时钟信号 ===//
+    //=== Step 1: 收集所有时钟信号（使用 base signal）===//
     llvm::DenseSet<Value> clockSignals;
     mod.walk([&](llhd::SignalOp sigOp) {
       if (sigOp->hasAttr("qemu.is_clock")) {
@@ -383,119 +439,206 @@ struct ClockDrvRemovalPass
     mod.walk([&](hw::HWModuleOp hwMod) {
       llvm::outs() << "\nModule: @" << hwMod.getName() << "\n";
 
-      //=== Step 2: 从 wait observed 列表中移除时钟 ===//
-      hwMod.walk([&](llhd::WaitOp waitOp) {
-        // 收集需要移除的 observed 索引
-        llvm::SmallVector<unsigned, 4> indicesToRemove;
-        auto observed = waitOp.getObserved();
+      // 收集需要删除的 process（纯时钟触发的 process）
+      llvm::SmallVector<llhd::ProcessOp, 4> processesToRemove;
 
-        for (unsigned i = 0; i < observed.size(); ++i) {
-          Value obs = observed[i];
-          if (auto prbOp = obs.getDefiningOp<llhd::PrbOp>()) {
-            if (clockSignals.count(prbOp.getSignal())) {
-              std::string sigName = getSignalName(prbOp.getSignal());
-              llvm::outs() << "[STEP 2] Remove from wait: " << sigName << "\n";
-              indicesToRemove.push_back(i);
+      //=== 对每个 clock-triggered process 进行处理 ===//
+      hwMod.walk([&](llhd::ProcessOp proc) {
+        // 只处理标记为 clock_triggered 的 process
+        if (!proc->hasAttr("qemu.clock_triggered"))
+          return;
+
+        llvm::outs() << "  Processing clock-triggered process at "
+                     << proc.getLoc() << "\n";
+
+        //=== Step 2a: 收集 waitBlocks（旧框架同款）===//
+        llvm::SmallPtrSet<Block*, 8> waitBlocks;
+        proc.walk([&](llhd::WaitOp waitOp) {
+          waitBlocks.insert(waitOp->getBlock());
+        });
+
+        bool processModified = false;
+        bool allConditionsRemoved = true;  // 是否所有触发条件都被移除
+
+        //=== Step 2b: 对触发门 cond_br 做最小化改写 ===//
+        llvm::SmallVector<cf::CondBranchOp, 8> condBrsToProcess;
+        proc.walk([&](cf::CondBranchOp condBr) {
+          condBrsToProcess.push_back(condBr);
+        });
+
+        for (cf::CondBranchOp condBr : condBrsToProcess) {
+          Value cond = condBr.getCondition();
+
+          // 使用 waitBlocks 判断 idle/body 分支
+          Block *trueDest = condBr.getTrueDest();
+          Block *falseDest = condBr.getFalseDest();
+
+          bool trueIsWait = waitBlocks.count(trueDest) > 0;
+          bool falseIsWait = waitBlocks.count(falseDest) > 0;
+
+          // 不是标准触发门（两边都在或都不在 waitBlocks）：不处理
+          if (trueIsWait == falseIsWait) {
+            allConditionsRemoved = false;
+            continue;
+          }
+
+          Block *idleBlock = trueIsWait ? trueDest : falseDest;
+          Block *bodyBlock = trueIsWait ? falseDest : trueDest;
+          OperandRange idleArgs = trueIsWait ? condBr.getTrueDestOperands()
+                                             : condBr.getFalseDestOperands();
+          OperandRange bodyArgs = trueIsWait ? condBr.getFalseDestOperands()
+                                             : condBr.getTrueDestOperands();
+
+          // 拍平 OR 条件
+          llvm::SmallVector<Value, 4> terms;
+          flattenOr(cond, terms);
+
+          // 分析每个 term，剔除 clock edge terms
+          llvm::SmallVector<Value, 4> remainingTerms;
+          bool removedAnyClockTerm = false;
+
+          for (Value term : terms) {
+            EdgeTermInfo info = analyzeEdgeTerm(term);
+            if (info.isEdgeTerm && isClockBaseSignal(info.baseSignal, clockSignals)) {
+              // 这是 clock edge term，剔除
+              llvm::outs() << "    [STEP 2b] Remove clock edge term for: "
+                           << getSignalName(info.baseSignal) << "\n";
+              removedAnyClockTerm = true;
+              removedClockTerms++;
+            } else {
+              // 保留（例如 reset edge term 或 enable guard）
+              remainingTerms.push_back(term);
+            }
+          }
+
+          if (!removedAnyClockTerm) {
+            // 没有移除任何 clock term，不改写（避免误伤 enable gating）
+            allConditionsRemoved = false;
+            continue;
+          }
+
+          processModified = true;
+
+          if (remainingTerms.empty()) {
+            // 所有 terms 都被移除：这个触发门只由 clock 触发
+            // 去掉 clock 后永不触发，跳转回 idle/wait 分支
+            llvm::outs() << "    [STEP 2b] All terms removed, jump to idle\n";
+            OpBuilder builder(condBr);
+            llvm::SmallVector<Value, 4> idleArgsVec(idleArgs.begin(), idleArgs.end());
+            builder.create<cf::BranchOp>(condBr.getLoc(), idleBlock, idleArgsVec);
+            condBr.erase();
+            rewrittenBranches++;
+          } else {
+            // 重建条件（只保留非 clock terms）
+            allConditionsRemoved = false;
+            OpBuilder builder(condBr);
+            Value newCond = rebuildOrChain(builder, condBr.getLoc(), remainingTerms);
+
+            // 创建新的 cond_br
+            llvm::SmallVector<Value, 4> trueArgsVec, falseArgsVec;
+            if (trueIsWait) {
+              trueArgsVec.assign(idleArgs.begin(), idleArgs.end());
+              falseArgsVec.assign(bodyArgs.begin(), bodyArgs.end());
+            } else {
+              trueArgsVec.assign(bodyArgs.begin(), bodyArgs.end());
+              falseArgsVec.assign(idleArgs.begin(), idleArgs.end());
+            }
+
+            builder.create<cf::CondBranchOp>(
+                condBr.getLoc(), newCond,
+                trueDest, trueArgsVec,
+                falseDest, falseArgsVec);
+            condBr.erase();
+            rewrittenBranches++;
+            llvm::outs() << "    [STEP 2b] Rebuilt trigger condition\n";
+          }
+        }
+
+        //=== Step 2c: 从 wait observed 中移除 clock probe ===//
+        if (processModified) {
+          proc.walk([&](llhd::WaitOp waitOp) {
+            llvm::SmallVector<unsigned, 4> indicesToRemove;
+            auto observed = waitOp.getObserved();
+            unsigned nonClockCount = 0;
+
+            for (unsigned i = 0; i < observed.size(); ++i) {
+              Value obs = observed[i];
+              if (auto prbOp = obs.getDefiningOp<llhd::PrbOp>()) {
+                if (isClockBaseSignal(prbOp.getSignal(), clockSignals)) {
+                  indicesToRemove.push_back(i);
+                } else {
+                  nonClockCount++;
+                }
+              } else {
+                nonClockCount++;
+              }
+            }
+
+            // 防止空 wait：如果移除后 observed 为空
+            if (nonClockCount == 0 && !indicesToRemove.empty()) {
+              // 这个 process 只由 clock 触发
+              if (allConditionsRemoved) {
+                // 触发条件也全被移除了：可以删除整个 process
+                llvm::outs() << "    [STEP 2c] Process is pure clock-only, mark for removal\n";
+                processesToRemove.push_back(proc);
+                return;  // 不需要继续处理 wait
+              } else {
+                // 保留至少一个 clock observed（不产生空 wait）
+                llvm::outs() << "    [STEP 2c] Keep one clock observed to avoid empty wait\n";
+                indicesToRemove.pop_back();
+              }
+            }
+
+            // 逆序移除
+            auto mutableObserved = waitOp.getObservedMutable();
+            for (auto it = indicesToRemove.rbegin(); it != indicesToRemove.rend(); ++it) {
+              std::string sigName = "unknown";
+              if (auto prbOp = observed[*it].getDefiningOp<llhd::PrbOp>()) {
+                sigName = getSignalName(prbOp.getSignal());
+              }
+              llvm::outs() << "    [STEP 2c] Remove from wait: " << sigName << "\n";
+              mutableObserved.erase(*it);
               removedFromWait++;
             }
-          }
-        }
-
-        // 逆序移除，避免索引变化
-        auto mutableObserved = waitOp.getObservedMutable();
-        for (auto it = indicesToRemove.rbegin(); it != indicesToRemove.rend(); ++it) {
-          mutableObserved.erase(*it);
+          });
         }
       });
 
-      //=== Step 3: 重写 CFG（将时钟边沿检测的 cond_br 改为无条件 br）===//
-      llvm::SmallVector<cf::CondBranchOp, 16> branchesToRewrite;
-
-      hwMod.walk([&](cf::CondBranchOp condBr) {
-        Value cond = condBr.getCondition();
-        if (isClockEdgeCondition(cond, clockSignals)) {
-          branchesToRewrite.push_back(condBr);
-        }
-      });
-
-      for (cf::CondBranchOp condBr : branchesToRewrite) {
-        // 确定目标 block：选择非 wait block 的分支
-        // 通常 true 分支是触发路径（包含 drv），false 分支是等待路径（包含 wait）
-        Block *targetBlock = nullptr;
-        llvm::SmallVector<Value, 4> targetArgs;
-
-        // 检查 false 分支是否包含 wait
-        Block *falseBlock = condBr.getFalseDest();
-        bool falseHasWait = false;
-        for (Operation &op : *falseBlock) {
-          if (isa<llhd::WaitOp>(op)) {
-            falseHasWait = true;
-            break;
-          }
-        }
-
-        if (falseHasWait) {
-          // false 分支是 wait，跳转到 true 分支
-          targetBlock = condBr.getTrueDest();
-          for (Value arg : condBr.getTrueDestOperands()) {
-            targetArgs.push_back(arg);
-          }
-          llvm::outs() << "[STEP 3] Rewrite cond_br -> br (to true branch)\n";
-        } else {
-          // 检查 true 分支
-          Block *trueBlock = condBr.getTrueDest();
-          bool trueHasWait = false;
-          for (Operation &op : *trueBlock) {
-            if (isa<llhd::WaitOp>(op)) {
-              trueHasWait = true;
-              break;
-            }
-          }
-
-          if (trueHasWait) {
-            targetBlock = condBr.getFalseDest();
-            for (Value arg : condBr.getFalseDestOperands()) {
-              targetArgs.push_back(arg);
-            }
-            llvm::outs() << "[STEP 3] Rewrite cond_br -> br (to false branch)\n";
-          } else {
-            // 两个分支都没有 wait，跳转到 true 分支（触发路径）
-            targetBlock = condBr.getTrueDest();
-            for (Value arg : condBr.getTrueDestOperands()) {
-              targetArgs.push_back(arg);
-            }
-            llvm::outs() << "[STEP 3] Rewrite cond_br -> br (default to true)\n";
-          }
-        }
-
-        // 创建无条件 br
-        OpBuilder builder(condBr);
-        builder.create<cf::BranchOp>(condBr.getLoc(), targetBlock, targetArgs);
-        condBr.erase();
-        rewrittenBranches++;
+      // 删除纯时钟触发的 process
+      for (llhd::ProcessOp proc : processesToRemove) {
+        llvm::outs() << "  [REMOVE PROCESS] Pure clock-only process\n";
+        proc.erase();
+        removedProcesses++;
       }
 
-      //=== Step 4: DCE - 删除死代码 ===//
-      llvm::outs() << "[STEP 4] Running DCE...\n";
-      runLocalDCE(hwMod, clockSignals, removedDCE);
+      //=== Step 3: DCE - 安全删除死代码 ===//
+      llvm::outs() << "  [STEP 3] Running safe DCE...\n";
+      runSafeDCE(hwMod, removedDCE);
 
-      //=== Step 5: 删除时钟的端口连接 drv ===//
+      //=== Step 4: 删除时钟的端口连接 drv（仅 BlockArgument 驱动值）===//
       llvm::SmallVector<llhd::DrvOp, 16> drvsToRemove;
       hwMod.walk([&](llhd::DrvOp drv) {
-        if (clockSignals.count(drv.getSignal())) {
-          drvsToRemove.push_back(drv);
+        if (isClockBaseSignal(drv.getSignal(), clockSignals)) {
+          // 按旧框架边界：只删除端口连接 drv（驱动值是 BlockArgument）
+          if (isa<BlockArgument>(drv.getValue())) {
+            drvsToRemove.push_back(drv);
+          } else {
+            std::string sigName = getSignalName(drv.getSignal());
+            llvm::outs() << "  [STEP 4] Keep logic drv (not port connection): "
+                         << sigName << "\n";
+          }
         }
       });
 
       for (llhd::DrvOp drv : drvsToRemove) {
         std::string sigName = getSignalName(drv.getSignal());
-        llvm::outs() << "[STEP 5] Remove drv: " << sigName << "\n";
+        llvm::outs() << "  [STEP 4] Remove port drv: " << sigName << "\n";
         drv.erase();
         removedDrvs++;
       }
     });
 
-    //=== Step 6: 删除时钟的 sig 定义 ===//
+    //=== Step 5: 删除时钟的 sig 定义（base signal 维度）===//
     llvm::SmallVector<llhd::SignalOp, 8> sigsToRemove;
     mod.walk([&](llhd::SignalOp sigOp) {
       if (sigOp->hasAttr("qemu.is_clock")) {
@@ -503,7 +646,7 @@ struct ClockDrvRemovalPass
           sigsToRemove.push_back(sigOp);
         } else {
           std::string sigName = getSignalName(sigOp.getResult());
-          llvm::outs() << "[STEP 6] Cannot remove sig (has users): "
+          llvm::outs() << "[STEP 5] Cannot remove sig (has users): "
                        << sigName << "\n";
         }
       }
@@ -511,18 +654,20 @@ struct ClockDrvRemovalPass
 
     for (llhd::SignalOp sigOp : sigsToRemove) {
       std::string sigName = getSignalName(sigOp.getResult());
-      llvm::outs() << "[STEP 6] Remove sig: " << sigName << "\n";
+      llvm::outs() << "[STEP 5] Remove sig: " << sigName << "\n";
       sigOp.erase();
       removedSignals++;
     }
 
     llvm::outs() << "\n----------------------------------------\n";
     llvm::outs() << "Summary:\n";
-    llvm::outs() << "  Removed from wait:   " << removedFromWait << "\n";
-    llvm::outs() << "  Rewritten branches:  " << rewrittenBranches << "\n";
-    llvm::outs() << "  DCE removed ops:     " << removedDCE << "\n";
-    llvm::outs() << "  Removed drvs:        " << removedDrvs << "\n";
-    llvm::outs() << "  Removed signals:     " << removedSignals << "\n";
+    llvm::outs() << "  Removed clock terms:   " << removedClockTerms << "\n";
+    llvm::outs() << "  Rewritten branches:    " << rewrittenBranches << "\n";
+    llvm::outs() << "  Removed from wait:     " << removedFromWait << "\n";
+    llvm::outs() << "  DCE removed ops:       " << removedDCE << "\n";
+    llvm::outs() << "  Removed port drvs:     " << removedDrvs << "\n";
+    llvm::outs() << "  Removed signals:       " << removedSignals << "\n";
+    llvm::outs() << "  Removed processes:     " << removedProcesses << "\n";
     llvm::outs() << "========================================\n\n";
   }
 };
