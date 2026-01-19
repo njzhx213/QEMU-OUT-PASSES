@@ -19,6 +19,7 @@ include_directories(
   ${CMAKE_CURRENT_BINARY_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/lib
+  ${CMAKE_CURRENT_SOURCE_DIR}/../qemu-output/src/lib  # For QEMUCodeGen.h
   ${CIRCT_INCLUDE_DIRS}
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
@@ -39,6 +40,11 @@ add_public_tablegen_target(QemuPassesIncGen)
 add_executable(qemu-passes
   tool_main.cpp
   lib/Passes.cpp
+  lib/DffDemoPass.cpp
+  lib/CombLogicExtractPass.cpp
+  lib/QEMUEmitCPass.cpp
+  # Include QEMUCodeGen from qemu-output for QEMU C code generation
+  ${CMAKE_CURRENT_SOURCE_DIR}/../qemu-output/src/lib/QEMUCodeGen.cpp
 )
 add_dependencies(qemu-passes QemuPassesIncGen)
 

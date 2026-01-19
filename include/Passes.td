@@ -63,3 +63,90 @@ def ClockDrvRemoval : Pass<"clock-drv-removal", "mlir::ModuleOp"> {
     - Optionally run after `drv-classification` pass
   }];
 }
+
+//===----------------------------------------------------------------------===//
+// Pass 4: APB 控制信号分析与优化
+//===----------------------------------------------------------------------===//
+
+def DffDemo : Pass<"dff-demo", "mlir::ModuleOp"> {
+  let summary = "APB control signal inference and optimization";
+  let description = [{
+    Analyzes APB control signals in LLHD IR:
+
+    1. Traces AND conditions to find pwrite-based trigger paths
+    2. Classifies paths as read (pwrite=0) or write (pwrite=1)
+    3. Identifies phase-agnostic signals (constant across all paths)
+    4. Replaces redundant signal probes with constants
+    5. Performs iterative DCE to remove dead probes, XORs, and signals
+
+    Output:
+    - Reports trigger conditions and their control signal requirements
+    - Reports branch-controlled state transitions
+    - Reports optimization statistics
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Pass 5: Combinational Logic Extraction
+//===----------------------------------------------------------------------===//
+
+def CombLogicExtract : Pass<"comb-logic-extract", "mlir::ModuleOp"> {
+  let summary = "Extract combinational logic for QEMU update_state()";
+  let description = [{
+    Extracts combinational logic (llhd.drv outside of llhd.process) and
+    translates it to C expressions for QEMU update_state().
+
+    Design aligns with qemu-output/src/lib/ClkAnalysisResult.cpp:
+    1. Walk all llhd.drv in hw.module
+    2. Filter out drv inside llhd.process (sequential logic)
+    3. Filter out module ports
+    4. Generate C expressions using CombTranslator
+
+    Output:
+    - JSON file with combinational assignments (target, expression, bitWidth)
+    - Module attribute qemu.comb_logic with the same data
+    - Console report of extracted assignments
+
+    Prerequisites:
+    - Should run after clock removal and APB optimization passes
+    - Input IR should be simplified for best expression generation
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Pass 6: QEMU C Code Emission
+//===----------------------------------------------------------------------===//
+
+def QEMUEmitC : Pass<"qemu-emit-c", "mlir::ModuleOp"> {
+  let summary = "Emit QEMU device C code from annotated LLHD IR";
+  let description = [{
+    Final pass in the LLHD-to-QEMU conversion pipeline. Reads qemu.* metadata
+    from the IR and emits QEMU-compatible C code using QEMUCodeGen.
+
+    Input metadata consumed:
+    - qemu.comb_logic on hw.module: combinational logic expressions
+    - qemu.clock_triggered on llhd.process: sequential process markers
+    - qemu.drv_class on llhd.drv: drive operation classifications
+
+    Output:
+    - <device>.c: QEMU device implementation
+    - <device>.h: QEMU device header
+
+    Design:
+    - Generates ONE QEMU device for the public top hw.module
+    - Flattens comb logic from all submodules into top device
+    - update_state() emits only metadata-driven assignments (no hardcoded IRQ)
+    - All signal names are sanitized with collision detection
+
+    Prerequisites:
+    - Must run after comb-logic-extract pass
+    - Input IR should have all qemu.* annotations
+  }];
+
+  let options = [
+    Option<"outputDir", "output-dir", "std::string", /*default=*/"\"qemu-output\"",
+           "Output directory for generated C files">,
+    Option<"deviceName", "device-name", "std::string", /*default=*/"\"\"",
+           "Override device name (default: use top module name)">
+  ];
+}
