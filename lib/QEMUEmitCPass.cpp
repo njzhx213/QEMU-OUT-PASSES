@@ -5,11 +5,11 @@
 // Reads qemu.* metadata from the IR and emits QEMU-compatible C code
 // using the existing QEMUCodeGen framework from qemu-output.
 //
-// Design:
-// - Generates ONE QEMU device with flattened state struct
-// - Uses hierarchical naming: <ModuleName>__<signalName>
-// - Rewrites comb_logic expressions to match sanitized field names
-// - All signal names are sanitized with collision detection
+// Design (aligned with original qemu-output architecture):
+// - Uses FLAT naming (no hierarchical prefix)
+// - Only APB-mapped registers appear in MMIO read/write
+// - All signals exist in state struct, but MMIO only exposes APB registers
+// - update_state() handles only combinational logic
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/BuiltinOps.h"
@@ -21,7 +21,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/Regex.h"
 
 // Include the existing QEMUCodeGen from qemu-output
 #include "QEMUCodeGen.h"
@@ -42,16 +41,11 @@ using namespace circt;
 namespace {
 
 //===----------------------------------------------------------------------===//
-// Helper: Name Qualification and Sanitization
+// Helper: Name Sanitization (FLAT - no hierarchy)
 //===----------------------------------------------------------------------===//
 
-/// Build qualified name with module prefix
-static std::string qualifyName(llvm::StringRef moduleName, llvm::StringRef signalName) {
-  return moduleName.str() + "__" + signalName.str();
-}
-
-/// Basic sanitization (same logic as QEMUCodeGen::sanitizeName)
-static std::string basicSanitize(llvm::StringRef name) {
+/// Sanitize signal name to valid C identifier (no module prefix)
+static std::string sanitizeName(llvm::StringRef name) {
   std::string result = name.str();
   for (char &c : result) {
     if (c == '.' || c == '[' || c == ']' || c == '-' || c == ' ' || c == ':') {
@@ -65,145 +59,159 @@ static std::string basicSanitize(llvm::StringRef name) {
 }
 
 //===----------------------------------------------------------------------===//
-// Signal Registry - Tracks all signals with unique sanitized names
+// Flat Signal Registry - FLAT naming (aligned with qemu-output architecture)
 //===----------------------------------------------------------------------===//
 
-class SignalRegistry {
+class FlatSignalRegistry {
 public:
   struct SignalInfo {
-    std::string qualifiedName;   // e.g., "gpio_ctrl__int_level"
-    std::string sanitizedName;   // e.g., "gpio_ctrl__int_level" (after sanitize)
+    std::string originalName;
+    std::string sanitizedName;
     unsigned bitWidth;
-    bool isPort;
-    bool isTopLevel;             // true if from top module (no prefix needed)
   };
 
-  /// Register a signal and get its unique sanitized name
-  std::string registerSignal(llvm::StringRef qualifiedName, unsigned bitWidth,
-                             bool isPort = false, bool isTopLevel = false) {
-    // Check if already registered
-    auto it = qualifiedToSanitized_.find(qualifiedName.str());
-    if (it != qualifiedToSanitized_.end()) {
+  /// Register a signal with flat name (no module prefix)
+  std::string registerSignal(llvm::StringRef signalName, unsigned bitWidth) {
+    std::string key = signalName.str();
+    auto it = nameToSanitized_.find(key);
+    if (it != nameToSanitized_.end()) {
       return it->second;
     }
 
-    // Sanitize the name
-    std::string sanitized = basicSanitize(qualifiedName);
+    std::string sanitized = sanitizeName(signalName);
 
     // Handle collisions
     std::string unique = sanitized;
     unsigned counter = 2;
-    while (usedSanitized_.count(unique)) {
+    while (usedNames_.count(unique)) {
       unique = sanitized + "_" + std::to_string(counter++);
     }
 
-    // Record mappings
-    qualifiedToSanitized_[qualifiedName.str()] = unique;
-    usedSanitized_.insert(unique);
+    nameToSanitized_[key] = unique;
+    usedNames_.insert(unique);
 
-    // Store signal info
     SignalInfo info;
-    info.qualifiedName = qualifiedName.str();
+    info.originalName = key;
     info.sanitizedName = unique;
     info.bitWidth = bitWidth;
-    info.isPort = isPort;
-    info.isTopLevel = isTopLevel;
     signals_[unique] = info;
 
     return unique;
   }
 
-  /// Lookup sanitized name for a qualified name
-  std::string lookup(llvm::StringRef qualifiedName) const {
-    auto it = qualifiedToSanitized_.find(qualifiedName.str());
-    if (it != qualifiedToSanitized_.end()) {
+  std::string lookup(llvm::StringRef name) const {
+    auto it = nameToSanitized_.find(name.str());
+    if (it != nameToSanitized_.end()) {
       return it->second;
     }
-    // Fallback: just sanitize
-    return basicSanitize(qualifiedName);
+    return sanitizeName(name);
   }
 
-  /// Check if a sanitized name exists
-  bool hasSanitized(llvm::StringRef sanitized) const {
-    return usedSanitized_.count(sanitized.str()) > 0;
-  }
-
-  /// Get all registered signals
   const std::map<std::string, SignalInfo>& getSignals() const {
     return signals_;
   }
 
-  /// Get the qualified->sanitized mapping
-  const std::map<std::string, std::string>& getMapping() const {
-    return qualifiedToSanitized_;
-  }
-
 private:
-  std::map<std::string, std::string> qualifiedToSanitized_;
-  llvm::StringSet<> usedSanitized_;
+  std::map<std::string, std::string> nameToSanitized_;
+  llvm::StringSet<> usedNames_;
   std::map<std::string, SignalInfo> signals_;
 };
 
 //===----------------------------------------------------------------------===//
-// Expression Rewriter - Rewrites s->field references in expressions
+// APB Mapping Extraction
 //===----------------------------------------------------------------------===//
 
-class ExpressionRewriter {
-public:
-  ExpressionRewriter(const SignalRegistry &registry) : registry_(registry) {}
+/// Extract APB register mappings from IR attributes or use default GPIO layout
+static std::vector<clk_analysis::APBRegisterMapping>
+extractAPBMappings(hw::HWModuleOp topModule, ModuleOp mod) {
+  std::vector<clk_analysis::APBRegisterMapping> mappings;
 
-  /// Rewrite all s->field references in an expression
-  /// Uses the registry's qualified->sanitized mapping
-  std::string rewrite(llvm::StringRef expression, llvm::StringRef modulePrefix) const {
-    std::string result = expression.str();
+  // Try to get from IR attribute
+  if (auto apbAttr = topModule->getAttrOfType<ArrayAttr>("qemu.apb_mappings")) {
+    for (Attribute elem : apbAttr) {
+      auto dictAttr = dyn_cast<DictionaryAttr>(elem);
+      if (!dictAttr) continue;
 
-    // Pattern: s->identifier
-    // We need to replace identifier with the sanitized qualified name
-    std::regex pattern(R"(s->([A-Za-z_][A-Za-z0-9_]*))");
-    std::string output;
-    std::sregex_iterator it(result.begin(), result.end(), pattern);
-    std::sregex_iterator end;
+      clk_analysis::APBRegisterMapping mapping;
 
-    size_t lastPos = 0;
-    while (it != end) {
-      std::smatch match = *it;
-      // Append text before the match
-      output += result.substr(lastPos, match.position() - lastPos);
-
-      // Get the field name
-      std::string fieldName = match[1].str();
-
-      // Try to find the qualified name
-      // First, try with module prefix
-      std::string qualifiedWithPrefix = modulePrefix.str() + fieldName;
-      std::string sanitized = registry_.lookup(qualifiedWithPrefix);
-
-      // If not found with prefix, try without (for top-level ports)
-      if (!registry_.hasSanitized(sanitized)) {
-        sanitized = registry_.lookup(fieldName);
+      if (auto addrAttr = dictAttr.getAs<IntegerAttr>("address")) {
+        mapping.address = addrAttr.getInt();
+      }
+      if (auto nameAttr = dictAttr.getAs<StringAttr>("register")) {
+        mapping.registerName = nameAttr.getValue().str();
+      }
+      if (auto widthAttr = dictAttr.getAs<IntegerAttr>("bitWidth")) {
+        mapping.bitWidth = widthAttr.getInt();
+      }
+      if (auto writableAttr = dictAttr.getAs<BoolAttr>("writable")) {
+        mapping.isWritable = writableAttr.getValue();
+      }
+      if (auto readableAttr = dictAttr.getAs<BoolAttr>("readable")) {
+        mapping.isReadable = readableAttr.getValue();
+      }
+      if (auto w1cAttr = dictAttr.getAs<BoolAttr>("isW1C")) {
+        mapping.isW1C = w1cAttr.getValue();
       }
 
-      // If still not found, use basic sanitization
-      if (!registry_.hasSanitized(sanitized)) {
-        sanitized = basicSanitize(fieldName);
-      }
-
-      // Append the rewritten reference
-      output += "s->" + sanitized;
-
-      lastPos = match.position() + match.length();
-      ++it;
+      mappings.push_back(mapping);
     }
-
-    // Append remaining text
-    output += result.substr(lastPos);
-
-    return output;
   }
 
-private:
-  const SignalRegistry &registry_;
-};
+  // If no IR attribute, use standard GPIO register layout (from original gpio_top.c)
+  if (mappings.empty()) {
+    llvm::errs() << "  [WARNING] No APB mappings found in IR, using standard GPIO layout\n";
+
+    // Standard GPIO APB register offsets (from original qemu-output/gpio0/gpio_top.c)
+    struct { uint32_t addr; const char* name; int width; bool writable; bool readable; } stdRegs[] = {
+      {0x00, "gpio_sw_data", 32, true, true},
+      {0x04, "gpio_sw_dir", 32, true, true},
+      {0x30, "gpio_int_en", 32, true, true},
+      {0x34, "gpio_int_mask", 32, true, true},
+      {0x38, "gpio_int_type", 32, true, true},
+      {0x3c, "gpio_int_pol", 32, true, true},
+      {0x40, "gpio_int_status", 32, false, true},  // Read-only
+      {0x44, "gpio_raw_int_status", 32, false, true},  // Read-only
+      {0x48, "gpio_debounce", 32, true, true},
+      {0x50, "gpio_ext_data", 32, false, true},  // Read-only
+      {0x60, "gpio_int_level_sync", 8, true, true},
+    };
+
+    for (const auto& reg : stdRegs) {
+      clk_analysis::APBRegisterMapping mapping;
+      mapping.address = reg.addr;
+      mapping.registerName = reg.name;
+      mapping.bitWidth = reg.width;
+      mapping.isWritable = reg.writable;
+      mapping.isReadable = reg.readable;
+      mapping.isW1C = false;
+      mappings.push_back(mapping);
+    }
+  }
+
+  return mappings;
+}
+
+/// Detect address conflicts in APB mappings
+static std::vector<clk_analysis::AddressConflict>
+detectAddressConflicts(const std::vector<clk_analysis::APBRegisterMapping>& mappings) {
+  std::vector<clk_analysis::AddressConflict> conflicts;
+
+  std::map<uint32_t, std::vector<std::string>> addrToRegs;
+  for (const auto& m : mappings) {
+    addrToRegs[m.address].push_back(m.registerName);
+  }
+
+  for (const auto& pair : addrToRegs) {
+    if (pair.second.size() > 1) {
+      clk_analysis::AddressConflict conflict;
+      conflict.address = pair.first;
+      conflict.registerNames = pair.second;
+      conflicts.push_back(conflict);
+    }
+  }
+
+  return conflicts;
+}
 
 //===----------------------------------------------------------------------===//
 // QEMUEmitCPass Implementation
@@ -219,6 +227,7 @@ struct QEMUEmitCPass
     llvm::errs() << "\n";
     llvm::errs() << "========================================\n";
     llvm::errs() << "QEMU C Code Emission Pass\n";
+    llvm::errs() << "(Aligned with original qemu-output architecture)\n";
     llvm::errs() << "========================================\n";
 
     // Step 1: Find the public top module
@@ -240,51 +249,63 @@ struct QEMUEmitCPass
     llvm::errs() << "Device name: " << devName << "\n";
     llvm::errs() << "Top module: @" << topModule.getName() << "\n";
 
-    // Step 2: Create signal registry and generator
-    SignalRegistry registry;
+    // Step 2: Create generator and registry (FLAT naming)
+    FlatSignalRegistry registry;
     qemu_codegen::QEMUDeviceGenerator gen(devName);
 
-    // Step 3: Collect signals from ALL modules
-    llvm::errs() << "\nCollecting signals from all modules...\n";
+    // Step 3: Extract APB mappings (this determines MMIO registers)
+    llvm::errs() << "\nExtracting APB register mappings...\n";
+    auto apbMappings = extractAPBMappings(topModule, mod);
+    auto conflicts = detectAddressConflicts(apbMappings);
 
+    llvm::errs() << "  Found " << apbMappings.size() << " APB register mappings:\n";
+    for (const auto& m : apbMappings) {
+      llvm::errs() << "    0x" << llvm::format_hex_no_prefix(m.address, 2)
+                   << ": " << m.registerName << " (" << m.bitWidth << "-bit, "
+                   << (m.isReadable && m.isWritable ? "RW" :
+                       (m.isReadable ? "RO" : "WO")) << ")\n";
+    }
+
+    if (!conflicts.empty()) {
+      llvm::errs() << "  Address conflicts detected:\n";
+      for (const auto& c : conflicts) {
+        llvm::errs() << "    0x" << llvm::format_hex_no_prefix(c.address, 2) << ": ";
+        for (size_t i = 0; i < c.registerNames.size(); i++) {
+          if (i > 0) llvm::errs() << ", ";
+          llvm::errs() << c.registerNames[i];
+        }
+        llvm::errs() << "\n";
+      }
+    }
+
+    // Set APB mappings and conflicts on generator
+    gen.setAPBMappings(apbMappings);
+    gen.setAddressConflicts(conflicts);
+
+    // Step 4: Collect ALL signals (flat naming) for struct
+    llvm::errs() << "\nCollecting signals (flat naming)...\n";
     unsigned totalSignals = 0;
-    unsigned totalCombLogic = 0;
 
-    // First pass: collect all signals with qualified names
+    // Collect signals from all modules (for the state struct)
     mod.walk([&](hw::HWModuleOp hwMod) {
-      std::string moduleName = hwMod.getName().str();
-      std::string modulePrefix = moduleName + "__";
-      bool isTopLevel = (hwMod == topModule);
-
-      llvm::errs() << "  Module: @" << moduleName;
-      if (isTopLevel) llvm::errs() << " (top)";
-      llvm::errs() << "\n";
-
-      // Collect ports
+      // Ports
       for (auto port : hwMod.getPortList()) {
         std::string portName = port.getName().str();
         unsigned bitWidth = 32;
         if (auto intTy = dyn_cast<IntegerType>(port.type)) {
           bitWidth = intTy.getWidth();
         }
-
-        // For top-level module, don't add prefix to ports
-        std::string qualifiedName = isTopLevel ? portName : (modulePrefix + portName);
-
-        // Register the signal
-        std::string sanitized = registry.registerSignal(qualifiedName, bitWidth,
-                                                        /*isPort=*/true,
-                                                        /*isTopLevel=*/isTopLevel);
+        registry.registerSignal(portName, bitWidth);
         totalSignals++;
       }
 
-      // Collect llhd.sig operations
+      // LLHD signals
       hwMod.walk([&](llhd::SignalOp sigOp) {
         std::string sigName;
         if (auto nameAttr = sigOp.getName()) {
           sigName = nameAttr->str();
         } else {
-          return; // Skip unnamed signals
+          return;
         }
 
         unsigned bitWidth = 32;
@@ -296,44 +317,33 @@ struct QEMUEmitCPass
           bitWidth = intTy.getWidth();
         }
 
-        std::string qualifiedName = modulePrefix + sigName;
-        registry.registerSignal(qualifiedName, bitWidth, /*isPort=*/false, /*isTopLevel=*/false);
+        registry.registerSignal(sigName, bitWidth);
         totalSignals++;
       });
 
-      // Collect comb_logic targets (to ensure they exist in struct)
+      // Signals from comb_logic
       if (auto combAttr = hwMod->getAttrOfType<ArrayAttr>("qemu.comb_logic")) {
         for (Attribute elem : combAttr) {
           auto dictAttr = dyn_cast<DictionaryAttr>(elem);
           if (!dictAttr) continue;
 
-          std::string target;
-          unsigned bitWidth = 32;
-
           if (auto targetAttr = dictAttr.getAs<StringAttr>("target")) {
-            target = targetAttr.getValue().str();
-          }
-          if (auto widthAttr = dictAttr.getAs<IntegerAttr>("bitWidth")) {
-            bitWidth = widthAttr.getInt();
-          }
-
-          if (!target.empty()) {
-            std::string qualifiedTarget = modulePrefix + target;
-            registry.registerSignal(qualifiedTarget, bitWidth, /*isPort=*/false, /*isTopLevel=*/false);
+            unsigned bitWidth = 32;
+            if (auto widthAttr = dictAttr.getAs<IntegerAttr>("bitWidth")) {
+              bitWidth = widthAttr.getInt();
+            }
+            registry.registerSignal(targetAttr.getValue(), bitWidth);
           }
 
-          // Also parse expression to find referenced fields
+          // Extract referenced signals from expression
           if (auto exprAttr = dictAttr.getAs<StringAttr>("expression")) {
             std::string expr = exprAttr.getValue().str();
-            // Extract s->field references
             std::regex pattern(R"(s->([A-Za-z_][A-Za-z0-9_]*))");
             std::sregex_iterator it(expr.begin(), expr.end(), pattern);
             std::sregex_iterator end;
             while (it != end) {
               std::string fieldName = (*it)[1].str();
-              std::string qualifiedField = modulePrefix + fieldName;
-              // Register with default width (will be updated if we see the actual signal)
-              registry.registerSignal(qualifiedField, 32, /*isPort=*/false, /*isTopLevel=*/false);
+              registry.registerSignal(fieldName, 32);
               ++it;
             }
           }
@@ -341,24 +351,20 @@ struct QEMUEmitCPass
       }
     });
 
-    llvm::errs() << "Total signals registered: " << totalSignals << "\n";
+    llvm::errs() << "  Total signals: " << totalSignals << "\n";
 
-    // Step 4: Add all signals to generator
-    llvm::errs() << "\nAdding signals to generator...\n";
-    for (const auto &pair : registry.getSignals()) {
-      const auto &info = pair.second;
+    // Step 5: Add all signals to generator (for state struct)
+    for (const auto& pair : registry.getSignals()) {
+      const auto& info = pair.second;
       gen.addSimpleReg(info.sanitizedName, info.bitWidth);
     }
 
-    // Step 5: Collect and rewrite combinational logic
+    // Step 6: Process combinational logic
     llvm::errs() << "\nProcessing combinational logic...\n";
     std::vector<clk_analysis::CombinationalAssignment> combLogic;
-    ExpressionRewriter rewriter(registry);
+    unsigned combCount = 0;
 
     mod.walk([&](hw::HWModuleOp hwMod) {
-      std::string moduleName = hwMod.getName().str();
-      std::string modulePrefix = moduleName + "__";
-
       auto combAttr = hwMod->getAttrOfType<ArrayAttr>("qemu.comb_logic");
       if (!combAttr) return;
 
@@ -366,8 +372,7 @@ struct QEMUEmitCPass
         auto dictAttr = dyn_cast<DictionaryAttr>(elem);
         if (!dictAttr) continue;
 
-        std::string target;
-        std::string expression;
+        std::string target, expression;
         unsigned bitWidth = 32;
 
         if (auto targetAttr = dictAttr.getAs<StringAttr>("target")) {
@@ -382,28 +387,19 @@ struct QEMUEmitCPass
 
         if (target.empty() || expression.empty()) continue;
 
-        // Qualify and rewrite
-        std::string qualifiedTarget = modulePrefix + target;
-        std::string sanitizedTarget = registry.lookup(qualifiedTarget);
-        std::string rewrittenExpr = rewriter.rewrite(expression, modulePrefix);
-
         clk_analysis::CombinationalAssignment assign;
-        assign.targetSignal = sanitizedTarget;
-        assign.expression = rewrittenExpr;
+        assign.targetSignal = registry.lookup(target);
+        assign.expression = expression;  // Expression already has s-> format
         assign.bitWidth = bitWidth;
         combLogic.push_back(assign);
-
-        llvm::errs() << "  [" << moduleName << "] " << target << " -> "
-                     << sanitizedTarget << "\n";
-        llvm::errs() << "    expr: " << rewrittenExpr << "\n";
-
-        totalCombLogic++;
+        combCount++;
       }
     });
 
     gen.setCombinationalLogic(combLogic);
+    llvm::errs() << "  Combinational assignments: " << combCount << "\n";
 
-    // Step 6: Detect GPIO inputs
+    // Step 7: Detect GPIO inputs
     for (auto port : topModule.getPortList()) {
       std::string portName = port.getName().str();
       if (portName.find("gpio") != std::string::npos && port.isInput()) {
@@ -415,26 +411,27 @@ struct QEMUEmitCPass
       }
     }
 
-    // Step 7: Generate output files
-    std::string outDir = outputDir.empty() ? "qemu-passes/generated" : std::string(outputDir);
+    // Step 8: Generate output files
+    std::string baseDir = outputDir.empty() ? "qemu-passes/output" : std::string(outputDir);
+    std::string outDir = baseDir + "/" + devName;
     llvm::sys::fs::create_directories(outDir);
 
     std::string headerPath = outDir + "/" + devName + ".h";
     std::string sourcePath = outDir + "/" + devName + ".c";
 
     llvm::errs() << "\nGenerating output files...\n";
+    llvm::errs() << "  Header: " << headerPath << "\n";
+    llvm::errs() << "  Source: " << sourcePath << "\n";
 
     // Generate header
     {
       std::error_code EC;
       llvm::raw_fd_ostream headerFile(headerPath, EC);
       if (EC) {
-        llvm::errs() << "Error: Cannot create " << headerPath << ": "
-                     << EC.message() << "\n";
+        llvm::errs() << "Error: Cannot create " << headerPath << ": " << EC.message() << "\n";
         return signalPassFailure();
       }
       gen.generateHeader(headerFile);
-      llvm::errs() << "  Header: " << headerPath << "\n";
     }
 
     // Generate source
@@ -442,19 +439,19 @@ struct QEMUEmitCPass
       std::error_code EC;
       llvm::raw_fd_ostream sourceFile(sourcePath, EC);
       if (EC) {
-        llvm::errs() << "Error: Cannot create " << sourcePath << ": "
-                     << EC.message() << "\n";
+        llvm::errs() << "Error: Cannot create " << sourcePath << ": " << EC.message() << "\n";
         return signalPassFailure();
       }
       gen.generateSource(sourceFile);
-      llvm::errs() << "  Source: " << sourcePath << "\n";
     }
 
     llvm::errs() << "\n========================================\n";
     llvm::errs() << "Summary:\n";
-    llvm::errs() << "  Output directory: " << outDir << "\n";
-    llvm::errs() << "  Total fields in struct: " << registry.getSignals().size() << "\n";
-    llvm::errs() << "  Combinational assignments: " << totalCombLogic << "\n";
+    llvm::errs() << "  Device: " << devName << "\n";
+    llvm::errs() << "  State struct fields: " << registry.getSignals().size() << "\n";
+    llvm::errs() << "  APB registers (MMIO): " << apbMappings.size() << "\n";
+    llvm::errs() << "  Combinational logic: " << combCount << "\n";
+    llvm::errs() << "  Output: " << outDir << "/\n";
     llvm::errs() << "========================================\n";
   }
 };
